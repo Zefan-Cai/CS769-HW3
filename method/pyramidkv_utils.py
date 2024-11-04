@@ -13,6 +13,13 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
     num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    
+    Args:
+        hidden_states (torch.Tensor): Input tensor of shape (batch, num_key_value_heads, seqlen, head_dim).
+        n_rep (int): Number of times to repeat the hidden states.
+
+    Returns:
+        torch.Tensor: Repeated hidden states tensor.
     """
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
@@ -22,8 +29,23 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class PyramidKVCluster():
+    """
+    Class for managing key-value pairs in a pyramid structure for attention mechanisms.
+    """
     def __init__(self, num_hidden_layers = 32, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', beta = 20, num_layers = 80, layer_idx=None):
-        
+        """
+        Initializes the PyramidKVCluster.
+
+        Args:
+            num_hidden_layers (int): Number of hidden layers.
+            window_size (int): Size of the window for attention.
+            max_capacity_prompt (int): Maximum capacity for the prompt.
+            kernel_size (int): Size of the kernel for pooling.
+            pooling (str): Pooling method ('avgpool' or 'maxpool').
+            beta (int): Beta parameter for capacity calculations.
+            num_layers (int): Total number of layers.
+            layer_idx (int): Index of the current layer.
+        """
         self.layer_idx = layer_idx
         self.num_hidden_layers = num_hidden_layers
         
@@ -32,19 +54,40 @@ class PyramidKVCluster():
         
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
-        assert self.max_capacity_prompt - self.window_size > 0
+        assert self.max_capacity_prompt - self.window_size > 0, "Max capacity must be greater than window size."
         self.kernel_size = kernel_size
         self.pooling = pooling
 
     def reset(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool'):
+        """
+        Resets the parameters of the cluster.
+
+        Args:
+            window_size (int): New window size.
+            max_capacity_prompt (int): New maximum capacity for the prompt.
+            kernel_size (int): New kernel size for pooling.
+            pooling (str): New pooling method.
+        """
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
-        assert self.max_capacity_prompt - self.window_size > 0
+        assert self.max_capacity_prompt - self.window_size > 0, "Max capacity must be greater than window size."
         self.kernel_size = kernel_size
         self.pooling = pooling
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        
+        """
+        Updates the key and value states based on the query states and attention mechanism.
+
+        Args:
+            key_states (torch.Tensor): Key states tensor.
+            query_states (torch.Tensor): Query states tensor.
+            value_states (torch.Tensor): Value states tensor.
+            attention_mask (torch.Tensor): Attention mask tensor.
+            num_key_value_groups (int): Number of key-value groups.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Updated key and value states.
+        """
         # check if prefix phase
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
@@ -64,9 +107,11 @@ class PyramidKVCluster():
         max_capacity_prompt = max_num - self.layer_idx * steps
         
         print(f"PyramidKV max_capacity_prompt {max_capacity_prompt}")
+        
         if q_len < self.max_capacity_prompt:
             return key_states, value_states
         elif q_len < (self.max_capacity_prompt - self.window_size) * 2:
+            # Calculate attention weights and apply attention mask
             attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)
             mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
             mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
@@ -78,12 +123,15 @@ class PyramidKVCluster():
 
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)
+            
+            # Pooling based on the specified method
             if self.pooling == 'avgpool':
                 attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
             elif self.pooling == 'maxpool':
                 attn_cache = F.max_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
             else:
                 raise ValueError('Pooling method not supported')
+            
             indices = attn_cache.topk(self.max_capacity_prompt - self.window_size, dim=-1).indices
             indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
             k_past_compress = key_states[:, :, :-self.window_size, :].gather(dim = 2, index = indices)
@@ -122,22 +170,55 @@ class PyramidKVCluster():
             return key_states, value_states
 
 class SnapKVCluster():
+    """
+    Class for managing key-value pairs in a snapshot structure for attention mechanisms.
+    """
     def __init__(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool'):
+        """
+        Initializes the SnapKVCluster.
+
+        Args:
+            window_size (int): Size of the window for attention.
+            max_capacity_prompt (int): Maximum capacity for the prompt.
+            kernel_size (int): Size of the kernel for pooling.
+            pooling (str): Pooling method ('avgpool' or 'maxpool').
+        """
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
-        assert self.max_capacity_prompt - self.window_size > 0
+        assert self.max_capacity_prompt - self.window_size > 0, "Max capacity must be greater than window size."
         self.kernel_size = kernel_size
         self.pooling = pooling
 
     def reset(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool'):
+        """
+        Resets the parameters of the cluster.
+
+        Args:
+            window_size (int): New window size.
+            max_capacity_prompt (int): New maximum capacity for the prompt.
+            kernel_size (int): New kernel size for pooling.
+            pooling (str): New pooling method.
+        """
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
-        assert self.max_capacity_prompt - self.window_size > 0
+        assert self.max_capacity_prompt - self.window_size > 0, "Max capacity must be greater than window size."
         self.kernel_size = kernel_size
         self.pooling = pooling
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        
+        """
+        Updates the key and value states based on the query states and attention mechanism.
+
+        Args:
+            key_states (torch.Tensor): Key states tensor.
+            query_states (torch.Tensor): Query states tensor.
+            value_states (torch.Tensor): Value states tensor.
+            attention_mask (torch.Tensor): Attention mask tensor.
+            num_key_value_groups (int): Number of key-value groups.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Updated key and value states.
+        """
         # check if prefix phase
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
@@ -177,6 +258,15 @@ class SnapKVCluster():
 
 class H2OKVCluster():
     def __init__(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool'):
+        """
+        Initializes the H2OKVCluster.
+
+        Args:
+            window_size (int): Size of the window for attention.
+            max_capacity_prompt (int): Maximum capacity for the prompt.
+            kernel_size (int): Size of the kernel for pooling.
+            pooling (str): Pooling method ('avgpool' or 'maxpool').
+        """
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         assert self.max_capacity_prompt - self.window_size > 0
@@ -184,6 +274,15 @@ class H2OKVCluster():
         self.pooling = pooling
 
     def reset(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool'):
+        """
+        Resets the parameters of the cluster.
+
+        Args:
+            window_size (int): New window size.
+            max_capacity_prompt (int): New maximum capacity for the prompt.
+            kernel_size (int): New kernel size for pooling.
+            pooling (str): New pooling method.
+        """
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         assert self.max_capacity_prompt - self.window_size > 0
@@ -191,7 +290,19 @@ class H2OKVCluster():
         self.pooling = pooling
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        
+        """
+        Updates the key and value states based on the query states and attention mechanism.
+
+        Args:
+            key_states (torch.Tensor): Key states tensor.
+            query_states (torch.Tensor): Query states tensor.
+            value_states (torch.Tensor): Value states tensor.
+            attention_mask (torch.Tensor): Attention mask tensor.
+            num_key_value_groups (int): Number of key-value groups.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Updated key and value states.
+        """
         # check if prefix phase
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
@@ -232,6 +343,15 @@ class H2OKVCluster():
 
 class StreamingLLMKVCluster():
     def __init__(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool'):
+        """
+        Initializes the StreamingLLMKVCluster.
+
+        Args:
+            window_size (int): Size of the window for attention.
+            max_capacity_prompt (int): Maximum capacity for the prompt.
+            kernel_size (int): Size of the kernel for pooling.
+            pooling (str): Pooling method ('avgpool' or 'maxpool').
+        """
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         assert self.max_capacity_prompt - self.window_size > 0
@@ -239,6 +359,15 @@ class StreamingLLMKVCluster():
         self.pooling = pooling
 
     def reset(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool'):
+        """
+        Resets the parameters of the cluster.
+
+        Args:
+            window_size (int): New window size.
+            max_capacity_prompt (int): New maximum capacity for the prompt.
+            kernel_size (int): New kernel size for pooling.
+            pooling (str): New pooling method.
+        """
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         assert self.max_capacity_prompt - self.window_size > 0
@@ -246,7 +375,19 @@ class StreamingLLMKVCluster():
         self.pooling = pooling
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        
+        """
+        Updates the key and value states based on the query states and attention mechanism.
+
+        Args:
+            key_states (torch.Tensor): Key states tensor.
+            query_states (torch.Tensor): Query states tensor.
+            value_states (torch.Tensor): Value states tensor.
+            attention_mask (torch.Tensor): Attention mask tensor.
+            num_key_value_groups (int): Number of key-value groups.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Updated key and value states.
+        """
         # check if prefix phase
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
@@ -290,6 +431,12 @@ class StreamingLLMKVCluster():
 
 
 def init_pyramidkv(self, num_hidden_layers):
+    """
+    Initializes the PyramidKVCluster for the model.
+
+    Args:
+        num_hidden_layers (int): Number of hidden layers.
+    """
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 32
@@ -311,6 +458,9 @@ def init_pyramidkv(self, num_hidden_layers):
         )
  
 def init_snapkv(self):
+    """
+    Initializes the SnapKVCluster for the model.
+    """
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 32
@@ -330,6 +480,9 @@ def init_snapkv(self):
         )
 
 def init_H2O(self):
+    """
+    Initializes the H2OKVCluster for the model.
+    """
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 32
@@ -349,6 +502,9 @@ def init_H2O(self):
         )
 
 def init_StreamingLLM(self):
+    """
+    Initializes the StreamingLLMKVCluster for the model.
+    """
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 32
